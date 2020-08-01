@@ -1,718 +1,795 @@
-'use strict';
+"use strict";
 
-var _ = require('underscore');
-var async = require('async');
-var EventEmitter = require('events').EventEmitter || require('events');
-var fs = require('fs');
-var path = require('path');
-var puppeteer = require('puppeteer');
-var request = require('request');
-var SafeEventEmitter = require('./lib/SafeEventEmitter');
-var UserAgent = require('user-agents');
+var _ = require("underscore");
+var async = require("async");
+var EventEmitter = require("events").EventEmitter || require("events");
+var fs = require("fs");
+var path = require("path");
+var chromium = require("chrome-aws-lambda");
+var puppeteer = chromium.puppeteer;
+var request = require("request");
+var SafeEventEmitter = require("./lib/SafeEventEmitter");
+var UserAgent = require("user-agents");
 
 var debug = {
-	error: require('debug')('data-sourcer:error'),
+  error: require("debug")("data-sourcer:error"),
 };
 
-var DataSourcer = module.exports = function(options) {
+var DataSourcer = (module.exports = function (options) {
+  this.options = this.prepareOptions(options, this.defaultOptions);
+  this.id = _.uniqueId("DataSourcer");
+  this.activeRequests = {};
+  this.sources = {};
+  this.preparingBrowser = false;
+  this.prepareInternalQueues();
+  this.pauseAllQueues();
 
-	this.options = this.prepareOptions(options, this.defaultOptions);
-	this.id = _.uniqueId('DataSourcer');
-	this.activeRequests = {};
-	this.sources = {};
-	this.preparingBrowser = false;
-	this.prepareInternalQueues();
-	this.pauseAllQueues();
-
-	if (this.options.sourcesDir) {
-		this.loadSourcesFromDir(this.options.sourcesDir);
-	}
-};
+  if (this.options.sourcesDir) {
+    this.loadSourcesFromDir(this.options.sourcesDir);
+  }
+});
 
 DataSourcer.browsers = {};
 DataSourcer.debug = debug;
 DataSourcer.SafeEventEmitter = SafeEventEmitter;
 
 DataSourcer.prototype.defaultOptions = {
-
-	/*
+  /*
 		Directory from which abstracts will be loaded.
 	*/
-	abstractsDir: path.join(__dirname, 'abstracts'),
+  abstractsDir: path.join(__dirname, "abstracts"),
 
-	/*
+  /*
 		Options to pass to puppeteer when creating a new browser instance.
 	*/
-	browser: {
-		headless: true,
-		slowMo: 0,
-		timeout: 10000,
-	},
+  browser: {
+    headless: true,
+    slowMo: 0,
+    timeout: 10000,
+  },
 
-	/*
+  /*
 		Default request module options. For example you could pass the 'proxy' option in this way.
 
 		See for more info:
 		https://github.com/request/request#requestdefaultsoptions
 	*/
-	defaultRequestOptions: null,
+  defaultRequestOptions: null,
 
-	filter: {
-		/*
+  filter: {
+    /*
 			The filter mode determines how some options will be used to exclude data.
 
 			For example when using the following filter option: `someField: ['1', '2']`:
 				'strict' mode will only allow data that has the 'someField' property equal to '1' or '2'; ie. data that is missing the 'someField' property will be excluded.
 				'loose' mode will allow data that has the 'someField' property of '1' or '2' as well as those that are missing the 'someField' property.
 		*/
-		mode: 'strict',
+    mode: "strict",
 
-		/*
+    /*
 			Include items by their property values. Examples:
 
 			`something: ['1', '2']`:
 				Each item's 'something' property must equal '1' or '2'.
 		*/
-		include: {
-		},
+    include: {},
 
-		/*
+    /*
 			Exclude items by their property values. Examples:
 
 			`something: ['3']`:
 				All items where 'something' equals '3' will be excluded.
 		*/
-		exclude: {
-		}
-	},
+    exclude: {},
+  },
 
-	/*
+  /*
 		The method name used to get data from a source. Required for each source.
 	*/
-	getDataMethodName: 'getData',
+  getDataMethodName: "getData",
 
-	/*
+  /*
 		Use a queue to limit the number of simultaneous HTTP requests.
 	*/
-	requestQueue: {
-		/*
+  requestQueue: {
+    /*
 			The maximum number of simultaneous requests. Must be greater than 0.
 		*/
-		concurrency: 10,
-		/*
+    concurrency: 10,
+    /*
 			The time (in milliseconds) between each request. Set to 0 for no delay.
 		*/
-		delay: 0,
-	},
+    delay: 0,
+  },
 
-	/*
+  /*
 		The maximum number of data items (while sampling) to emit via the 'data' event.
 	*/
-	sampleDataLimit: 10,
+  sampleDataLimit: 10,
 
-	/*
+  /*
 		Set to TRUE to have all asynchronous operations run in series.
 	*/
-	series: false,
+  series: false,
 
-	/*
+  /*
 		Exclude data sources by name.
 
 		All data sources except 'somewhere-else':
 		['somewhere-else']
 	*/
-	sourcesBlackList: null,
+  sourcesBlackList: null,
 
-	/*
+  /*
 		Directory from which sources will be loaded.
 	*/
-	sourcesDir: null,
+  sourcesDir: null,
 
-	/*
+  /*
 		Include data sources by name.
 
 		Only 'somewhere':
 		['somewhere']
 	*/
-	sourcesWhiteList: null,
+  sourcesWhiteList: null,
 };
 
-DataSourcer.prototype.addSource = function(name, source) {
+DataSourcer.prototype.addSource = function (name, source) {
+  if (!this.isValidSourceName(name)) {
+    throw new Error('Invalid source name: "' + name + '"');
+  }
 
-	if (!this.isValidSourceName(name)) {
-		throw new Error('Invalid source name: "' + name + '"');
-	}
+  if (this.sourceExists(name)) {
+    throw new Error('Source already exists: "' + name + '"');
+  }
 
-	if (this.sourceExists(name)) {
-		throw new Error('Source already exists: "' + name + '"');
-	}
+  if (!_.isObject(source) || _.isNull(source)) {
+    throw new Error('Expected "source" to be an object.');
+  }
 
-	if (!_.isObject(source) || _.isNull(source)) {
-		throw new Error('Expected "source" to be an object.');
-	}
+  if (source.abstract) {
+    var abstract = this.loadAbstract(source.abstract);
+    source = _.defaults(source, abstract);
+    if (abstract.defaultOptions) {
+      source.defaultOptions = _.defaults(
+        source.defaultOptions || {},
+        abstract.defaultOptions
+      );
+      _.each(abstract.defaultOptions, function (defaultOptions, key) {
+        if (_.isObject(defaultOptions)) {
+          source.defaultOptions[key] = _.defaults(
+            source.defaultOptions[key],
+            defaultOptions
+          );
+        }
+      });
+    }
+  }
 
-	if (source.abstract) {
-		var abstract = this.loadAbstract(source.abstract);
-		source = _.defaults(source, abstract);
-		if (abstract.defaultOptions) {
-			source.defaultOptions = _.defaults(source.defaultOptions || {}, abstract.defaultOptions);
-			_.each(abstract.defaultOptions, function(defaultOptions, key) {
-				if (_.isObject(defaultOptions)) {
-					source.defaultOptions[key] = _.defaults(source.defaultOptions[key], defaultOptions);
-				}
-			});
-		}
-	}
+  var getData = source[this.options.getDataMethodName];
+  if (!getData || !_.isFunction(getData)) {
+    throw new Error(
+      'Source missing required method: "' + this.options.getDataMethodName + '"'
+    );
+  }
 
-	var getData = source[this.options.getDataMethodName];
-	if (!getData || !_.isFunction(getData)) {
-		throw new Error('Source missing required method: "' + this.options.getDataMethodName + '"');
-	}
-
-	this.sources[name] = source;
+  this.sources[name] = source;
 };
 
-DataSourcer.prototype.close = function(done) {
+DataSourcer.prototype.close = function (done) {
+  try {
+    this.pauseAllQueues();
+    this.abortActiveRequests();
+  } catch (error) {
+    return done(error);
+  }
 
-	try {
-		this.pauseAllQueues();
-		this.abortActiveRequests();
-	} catch (error) {
-		return done(error);
-	}
-
-	async.parallel([
-		this.closeBrowser.bind(this),
-	], done);
+  async.parallel([this.closeBrowser.bind(this)], done);
 };
 
-DataSourcer.prototype.abortActiveRequests = function() {
-
-	_.invoke(this.activeRequests, 'abort');
-	this.activeRequests = {};
+DataSourcer.prototype.abortActiveRequests = function () {
+  _.invoke(this.activeRequests, "abort");
+  this.activeRequests = {};
 };
 
-DataSourcer.prototype.closeBrowser = function(done) {
-
-	if (this.browser) {
-		this.browser.close().then(function() {
-			this.browser = DataSourcer.browsers[this.id] = null;
-			done();
-		}.bind(this)).catch(done);
-	} else {
-		_.defer(done);
-	}
+DataSourcer.prototype.closeBrowser = function (done) {
+  if (this.browser) {
+    this.browser
+      .close()
+      .then(
+        function () {
+          this.browser = DataSourcer.browsers[this.id] = null;
+          done();
+        }.bind(this)
+      )
+      .catch(done);
+  } else {
+    _.defer(done);
+  }
 };
 
-DataSourcer.prototype.loadAbstract = function(name) {
+DataSourcer.prototype.loadAbstract = function (name) {
+  if (!this.options.abstractsDir) {
+    throw new Error(
+      'Cannot load abstract because the "abstractsDir" option is not set'
+    );
+  }
 
-	if (!this.options.abstractsDir) {
-		throw new Error('Cannot load abstract because the "abstractsDir" option is not set');
-	}
-
-	var abstractFilePath = path.join(this.options.abstractsDir, name);
-	var abstract = _.clone(require(abstractFilePath));
-	if (this.options.getDataMethodName !== 'getData') {
-		abstract[this.options.getDataMethodName] = abstract.getData;
-		abstract = _.omit(abstract, 'getData');
-	}
-	return abstract;
+  var abstractFilePath = path.join(this.options.abstractsDir, name);
+  var abstract = _.clone(require(abstractFilePath));
+  if (this.options.getDataMethodName !== "getData") {
+    abstract[this.options.getDataMethodName] = abstract.getData;
+    abstract = _.omit(abstract, "getData");
+  }
+  return abstract;
 };
 
-DataSourcer.prototype.arrayToObjectHash = function(array) {
-
-	return _.object(_.map(array, function(value) {
-		return [value, true];
-	}));
+DataSourcer.prototype.arrayToObjectHash = function (array) {
+  return _.object(
+    _.map(array, function (value) {
+      return [value, true];
+    })
+  );
 };
 
-DataSourcer.prototype.filterData = function(data, options) {
+DataSourcer.prototype.filterData = function (data, options) {
+  options = options || {};
 
-	options = options || {};
+  var strict = options.mode === "strict";
 
-	var strict = options.mode === 'strict';
+  return _.filter(data, function (item) {
+    if (!item || !_.isObject(item) || _.isEmpty(item)) {
+      return false;
+    }
 
-	return _.filter(data, function(item) {
+    var passedInclude =
+      !options.include ||
+      _.every(options.include, function (test, field) {
+        if (!test || (!strict && !item[field])) {
+          // Ignore this test.
+          return true;
+        }
 
-		if (!item || !_.isObject(item) || _.isEmpty(item)) {
-			return false;
-		}
+        if (_.isArray(item[field])) {
+          return _.some(item[field], function (value) {
+            return !!test[value];
+          });
+        }
+        return !!test[item[field]];
+      });
 
-		var passedInclude = !options.include || _.every(options.include, function(test, field) {
+    if (!passedInclude) {
+      return false;
+    }
 
-			if (!test || (!strict && !item[field])) {
-				// Ignore this test.
-				return true;
-			}
+    var passedExclude =
+      !options.exclude ||
+      _.every(options.exclude, function (test, field) {
+        if (!test || (!strict && !item[field])) {
+          // Ignore this test.
+          return true;
+        }
 
-			if (_.isArray(item[field])) {
-				return _.some(item[field], function(value) {
-					return !!test[value];
-				});
-			}
-			return !!test[item[field]];
-		});
+        if (_.isArray(item[field])) {
+          return _.every(item[field], function (value) {
+            return !test[value];
+          });
+        }
 
-		if (!passedInclude) {
-			return false;
-		}
+        return !test[item[field]];
+      });
 
-		var passedExclude = !options.exclude || _.every(options.exclude, function(test, field) {
+    if (!passedExclude) {
+      return false;
+    }
 
-			if (!test || (!strict && !item[field])) {
-				// Ignore this test.
-				return true;
-			}
-
-			if (_.isArray(item[field])) {
-				return _.every(item[field], function(value) {
-					return !test[value];
-				});
-			}
-
-			return !test[item[field]];
-		});
-
-		if (!passedExclude) {
-			return false;
-		}
-
-		return true;
-	});
+    return true;
+  });
 };
 
-DataSourcer.prototype.processData = function(data, fn, options) {
+DataSourcer.prototype.processData = function (data, fn, options) {
+  if (!_.isFunction(fn)) {
+    throw new Error('Missing required process function ("fn")');
+  }
 
-	if (!_.isFunction(fn)) {
-		throw new Error('Missing required process function ("fn")');
-	}
+  options = options || {};
 
-	options = options || {};
-
-	return _.chain(data).map(function(item) {
-		item = _.clone(item);
-		item = fn(item);
-		if (!item || !_.isObject(item) || _.isEmpty(item)) return null;
-		if (options.extend) {
-			item = _.extend({}, item, options.extend);
-		}
-		return item;
-	}).compact().value();
+  return _.chain(data)
+    .map(function (item) {
+      item = _.clone(item);
+      item = fn(item);
+      if (!item || !_.isObject(item) || _.isEmpty(item)) return null;
+      if (options.extend) {
+        item = _.extend({}, item, options.extend);
+      }
+      return item;
+    })
+    .compact()
+    .value();
 };
 
-DataSourcer.prototype.getData = function(options) {
+DataSourcer.prototype.getData = function (options) {
+  var emitter = this.prepareSafeEventEmitter();
 
-	var emitter = this.prepareSafeEventEmitter();
+  _.defer(
+    function () {
+      options = this.prepareOptions(options, this.options);
 
-	_.defer(function() {
+      var sources = this.listSources(options);
+      var asyncMethod = options.series === true ? "eachSeries" : "each";
+      var onData = emitter.emit.bind(emitter, "data");
+      var onError = emitter.emit.bind(emitter, "error");
+      var onEnd = _.once(emitter.emit.bind(emitter, "end"));
+      var getDataFromSource = this.getDataFromSource.bind(this);
 
-		options = this.prepareOptions(options, this.options);
+      async[asyncMethod](
+        sources,
+        function (source, next) {
+          var sourceEmitter;
 
-		var sources = this.listSources(options);
-		var asyncMethod = options.series === true ? 'eachSeries' : 'each';
-		var onData = emitter.emit.bind(emitter, 'data');
-		var onError = emitter.emit.bind(emitter, 'error');
-		var onEnd = _.once(emitter.emit.bind(emitter, 'end'));
-		var getDataFromSource = this.getDataFromSource.bind(this);
+          var onSourceError = function (error) {
+            // Add the source's name to the error messages.
+            error.message = "[" + source.name + "] " + error.message;
+            onError(error);
+          };
 
-		async[asyncMethod](sources, function(source, next) {
+          var onSourceEnd = function () {
+            if (sourceEmitter) {
+              sourceEmitter.removeAllListeners();
+              sourceEmitter = null;
+            }
+            next();
+          };
 
-			var sourceEmitter;
+          try {
+            sourceEmitter = getDataFromSource(source.name, options)
+              .on("data", onData)
+              .on("error", onSourceError)
+              .once("end", onSourceEnd);
+          } catch (error) {
+            onSourceError(error);
+            onSourceEnd();
+          }
+        },
+        onEnd
+      );
+    }.bind(this)
+  );
 
-			var onSourceError = function(error) {
-				// Add the source's name to the error messages.
-				error.message = '[' + source.name + '] ' + error.message;
-				onError(error);
-			};
-
-			var onSourceEnd = function() {
-				if (sourceEmitter) {
-					sourceEmitter.removeAllListeners();
-					sourceEmitter = null;
-				}
-				next();
-			};
-
-			try {
-				sourceEmitter = getDataFromSource(source.name, options)
-					.on('data', onData)
-					.on('error', onSourceError)
-					.once('end', onSourceEnd);
-			} catch (error) {
-				onSourceError(error);
-				onSourceEnd();
-			}
-
-		}, onEnd);
-
-	}.bind(this));
-
-	return emitter;
+  return emitter;
 };
 
 // Get data from a single source.
-DataSourcer.prototype.getDataFromSource = function(name, options) {
+DataSourcer.prototype.getDataFromSource = function (name, options) {
+  if (!this.sourceExists(name)) {
+    throw new Error('Data source does not exist: "' + name + '"');
+  }
 
-	if (!this.sourceExists(name)) {
-		throw new Error('Data source does not exist: "' + name + '"');
-	}
+  options = this.prepareOptions(options, this.options);
+  options = _.defaults(options || {}, {
+    process: _.identity,
+  });
 
-	options = this.prepareOptions(options, this.options);
-	options = _.defaults(options || {}, {
-		process: _.identity,
-	});
+  var source = this.sources[name];
 
-	var source = this.sources[name];
+  if (source.requiredOptions) {
+    _.each(source.requiredOptions, function (message, key) {
+      if (
+        _.isEmpty(options.sourceOptions) ||
+        !options.sourceOptions[name] ||
+        !_.isObject(options.sourceOptions[name]) ||
+        _.isUndefined(options.sourceOptions[name][key])
+      ) {
+        throw new Error(
+          "Missing required option (`sourceOptions." +
+            name +
+            "." +
+            key +
+            "`): " +
+            message
+        );
+      }
+    });
+  }
 
-	if (source.requiredOptions) {
-		_.each(source.requiredOptions, function(message, key) {
-			if (
-				_.isEmpty(options.sourceOptions) ||
-				!options.sourceOptions[name] ||
-				!_.isObject(options.sourceOptions[name]) ||
-				_.isUndefined(options.sourceOptions[name][key])
-			) {
-				throw new Error('Missing required option (`sourceOptions.' + name + '.' + key + '`): ' + message);
-			}
-		});
-	}
+  var sourceOptions = this.prepareSourceOptions(name, options);
 
-	var sourceOptions = this.prepareSourceOptions(name, options);
+  // Wrap the newPage function so that we can keep an array of all pages created by this source.
+  // Later we will close these pages when the end event is sent.
+  var pages = [];
+  sourceOptions.newPage = (function (newPage) {
+    return function (cb) {
+      newPage(function (error, page) {
+        if (error) return cb(error);
+        pages.push(page);
+        cb(null, page);
+      });
+    };
+  })(sourceOptions.newPage);
 
-	// Wrap the newPage function so that we can keep an array of all pages created by this source.
-	// Later we will close these pages when the end event is sent.
-	var pages = [];
-	sourceOptions.newPage = (function(newPage) {
-		return function(cb) {
-			newPage(function(error, page) {
-				if (error) return cb(error);
-				pages.push(page);
-				cb(null, page);
-			});
-		};
-	})(sourceOptions.newPage);
+  var getData = source[this.options.getDataMethodName].bind(source);
+  var gettingDataEmitter = getData(sourceOptions);
 
-	var getData = source[this.options.getDataMethodName].bind(source);
-	var gettingDataEmitter = getData(sourceOptions);
+  if (!(gettingDataEmitter instanceof EventEmitter)) {
+    throw new Error(
+      "[" +
+        name +
+        "] Expected source's " +
+        this.options.getDataMethodName +
+        " method to return an instance of the event emitter class."
+    );
+  }
 
-	if (!(gettingDataEmitter instanceof EventEmitter)) {
-		throw new Error('[' + name + '] Expected source\'s ' + this.options.getDataMethodName + ' method to return an instance of the event emitter class.');
-	}
+  var filterOptions = this.prepareFilterOptions(options.filter);
+  var filterData = this.filterData.bind(this);
+  var processData = this.processData.bind(this);
+  var emitter = this.prepareSafeEventEmitter();
 
-	var filterOptions = this.prepareFilterOptions(options.filter);
-	var filterData = this.filterData.bind(this);
-	var processData = this.processData.bind(this);
-	var emitter = this.prepareSafeEventEmitter();
+  var onData = function (data) {
+    data || (data = []);
+    data = processData(data, options.process, {
+      extend: {
+        // Add the 'source' attribute to every item:
+        source: name,
+      },
+    });
+    data = filterData(data, filterOptions);
+    if (data.length > 0) {
+      if (options.sample && options.sampleDataLimit) {
+        data = data.slice(0, options.sampleDataLimit);
+      }
+      emitter.emit("data", data);
+    }
+  };
 
-	var onData = function(data) {
-		data || (data = []);
-		data = processData(data, options.process, {
-			extend: {
-				// Add the 'source' attribute to every item:
-				source: name,
-			},
-		});
-		data = filterData(data, filterOptions);
-		if (data.length > 0) {
-			if (options.sample && options.sampleDataLimit) {
-				data = data.slice(0, options.sampleDataLimit);
-			}
-			emitter.emit('data', data);
-		}
-	};
+  var onError = emitter.emit.bind(emitter, "error");
+  var onEnd = _.once(function () {
+    if (gettingDataEmitter) {
+      gettingDataEmitter.removeAllListeners();
+      gettingDataEmitter = null;
+    }
+    async.each(
+      pages,
+      function (page, next) {
+        if (page.isClosed()) return next();
+        page
+          .close()
+          .then(function () {
+            next();
+          })
+          .catch(function (error) {
+            onError(error);
+            next();
+          });
+      },
+      function () {
+        emitter.emit("end");
+      }
+    );
+  });
 
-	var onError = emitter.emit.bind(emitter, 'error');
-	var onEnd = _.once(function() {
-		if (gettingDataEmitter) {
-			gettingDataEmitter.removeAllListeners();
-			gettingDataEmitter = null;
-		}
-		async.each(pages, function(page, next) {
-			if (page.isClosed()) return next();
-			page.close().then(function() {
-				next();
-			}).catch(function(error) {
-				onError(error);
-				next();
-			});
-		}, function() {
-			emitter.emit('end');
-		});
-	});
+  gettingDataEmitter.on("data", onData).on("error", onError).once("end", onEnd);
 
-	gettingDataEmitter
-		.on('data', onData)
-		.on('error', onError)
-		.once('end', onEnd);
-
-	return emitter;
+  return emitter;
 };
 
-DataSourcer.prototype.listSources = function(options) {
+DataSourcer.prototype.listSources = function (options) {
+  options = options || {};
 
-	options = options || {};
+  var sourcesWhiteList =
+    options.sourcesWhiteList &&
+    this.arrayToObjectHash(options.sourcesWhiteList);
+  var sourcesBlackList =
+    options.sourcesBlackList &&
+    this.arrayToObjectHash(options.sourcesBlackList);
 
-	var sourcesWhiteList = options.sourcesWhiteList && this.arrayToObjectHash(options.sourcesWhiteList);
-	var sourcesBlackList = options.sourcesBlackList && this.arrayToObjectHash(options.sourcesBlackList);
+  var names = _.chain(this.sources)
+    .keys()
+    .filter(function (name) {
+      if (sourcesWhiteList) return sourcesWhiteList[name];
+      if (sourcesBlackList) return !sourcesBlackList[name];
+      return true;
+    })
+    .value();
 
-	var names = _.chain(this.sources).keys().filter(function(name) {
-		if (sourcesWhiteList) return sourcesWhiteList[name];
-		if (sourcesBlackList) return !sourcesBlackList[name];
-		return true;
-	}).value();
-
-	return _.map(names, function(name) {
-		var source = this.sources[name];
-		return _.defaults(_.pick(source, 'defaultOptions', 'homeUrl', 'requiredOptions'), {
-			defaultOptions: {},
-			homeUrl: '',
-			name: name || '',
-			requiredOptions: {},
-		});
-	}, this);
+  return _.map(
+    names,
+    function (name) {
+      var source = this.sources[name];
+      return _.defaults(
+        _.pick(source, "defaultOptions", "homeUrl", "requiredOptions"),
+        {
+          defaultOptions: {},
+          homeUrl: "",
+          name: name || "",
+          requiredOptions: {},
+        }
+      );
+    },
+    this
+  );
 };
 
-DataSourcer.prototype.loadSourcesFromDir = function(dirPath) {
-
-	var files = fs.readdirSync(dirPath);
-	_.each(files, function(file) {
-		var filePath = path.join(dirPath, file);
-		this.loadSourceFromFile(filePath);
-	}, this);
+DataSourcer.prototype.loadSourcesFromDir = function (dirPath) {
+  var files = fs.readdirSync(dirPath);
+  _.each(
+    files,
+    function (file) {
+      var filePath = path.join(dirPath, file);
+      this.loadSourceFromFile(filePath);
+    },
+    this
+  );
 };
 
-DataSourcer.prototype.loadSourceFromFile = function(filePath) {
+DataSourcer.prototype.loadSourceFromFile = function (filePath) {
+  try {
+    var name = path.basename(filePath, ".js");
+    var source = require(filePath);
+    this.addSource(name, source);
+  } catch (error) {
+    debug.error(error);
+    return false;
+  }
 
-	try {
-		var name = path.basename(filePath, '.js');
-		var source = require(filePath);
-		this.addSource(name, source);
-	} catch (error) {
-		debug.error(error);
-		return false;
-	}
-
-	return true;
+  return true;
 };
 
-DataSourcer.prototype.prepareFilterOptions = function(options) {
+DataSourcer.prototype.prepareFilterOptions = function (options) {
+  options = JSON.parse(JSON.stringify(options || {}));
 
-	options = JSON.parse(JSON.stringify(options || {}));
+  var filterOptions = _.defaults(options || {}, {
+    mode: "strict",
+  });
 
-	var filterOptions = _.defaults(options || {}, {
-		mode: 'strict'
-	});
+  var arrayToObjectHash = this.arrayToObjectHash.bind(this);
 
-	var arrayToObjectHash = this.arrayToObjectHash.bind(this);
+  _.each(["include", "exclude"], function (type) {
+    filterOptions[type] = _.mapObject(filterOptions[type], function (values) {
+      return arrayToObjectHash(values);
+    });
+  });
 
-	_.each(['include', 'exclude'], function(type) {
-		filterOptions[type] = _.mapObject(filterOptions[type], function(values) {
-			return arrayToObjectHash(values);
-		});
-	});
-
-	return filterOptions;
+  return filterOptions;
 };
 
-DataSourcer.prototype.prepareOptions = function(options, defaultOptions) {
+DataSourcer.prototype.prepareOptions = function (options, defaultOptions) {
+  defaultOptions = defaultOptions || {};
+  options = _.defaults(options || {}, defaultOptions);
 
-	defaultOptions = (defaultOptions || {});
-	options = _.defaults(options || {}, defaultOptions);
+  if (!_.isUndefined(defaultOptions.browser)) {
+    options.browser = _.defaults(options.browser || {}, defaultOptions.browser);
+  }
 
-	if (!_.isUndefined(defaultOptions.browser)) {
-		options.browser = _.defaults(options.browser || {}, defaultOptions.browser);
-	}
+  if (!_.isUndefined(defaultOptions.filter)) {
+    options.filter = _.defaults(
+      options.filter || {},
+      defaultOptions.filter || {}
+    );
+    options.filter.include = _.defaults(
+      options.filter.include || {},
+      defaultOptions.filter.include || {}
+    );
+    options.filter.exclude = _.defaults(
+      options.filter.exclude || {},
+      defaultOptions.filter.exclude || {}
+    );
+  }
 
-	if (!_.isUndefined(defaultOptions.filter)) {
-		options.filter = _.defaults(options.filter || {}, defaultOptions.filter || {});
-		options.filter.include = _.defaults(options.filter.include || {}, defaultOptions.filter.include || {});
-		options.filter.exclude = _.defaults(options.filter.exclude || {}, defaultOptions.filter.exclude || {});
-	}
+  if (!_.isUndefined(defaultOptions.requestQueue)) {
+    options.requestQueue = _.defaults(
+      options.requestQueue || {},
+      defaultOptions.requestQueue
+    );
+  }
 
-	if (!_.isUndefined(defaultOptions.requestQueue)) {
-		options.requestQueue = _.defaults(options.requestQueue || {}, defaultOptions.requestQueue);
-	}
-
-	return options;
+  return options;
 };
 
-DataSourcer.prototype.prepareSourceOptions = function(name, options) {
+DataSourcer.prototype.prepareSourceOptions = function (name, options) {
+  if (!this.sourceExists(name)) {
+    throw new Error('Data source does not exist: "' + name + '"');
+  }
 
-	if (!this.sourceExists(name)) {
-		throw new Error('Data source does not exist: "' + name + '"');
-	}
+  options = options || {};
 
-	options = options || {};
+  var source = this.sources[name];
 
-	var source = this.sources[name];
+  var sourceOptions = _.omit(
+    options,
+    "browser",
+    "defaultRequestOptions",
+    "requestQueue",
+    "sourcesBlackList",
+    "sourcesWhiteList"
+  );
 
-	var sourceOptions = _.omit(options,
-		'browser',
-		'defaultRequestOptions',
-		'requestQueue',
-		'sourcesBlackList',
-		'sourcesWhiteList'
-	);
+  // Deep clone the options object.
+  // This prevents mutating the original options object.
+  sourceOptions = JSON.parse(JSON.stringify(sourceOptions || {}));
 
-	// Deep clone the options object.
-	// This prevents mutating the original options object.
-	sourceOptions = JSON.parse(JSON.stringify(sourceOptions || {}));
+  // Only include the sourceOptions for this source.
+  sourceOptions.sourceOptions =
+    (sourceOptions.sourceOptions && sourceOptions.sourceOptions[name]) || {};
+  sourceOptions.sourceOptions = _.defaults(
+    sourceOptions.sourceOptions,
+    source.defaultOptions || {}
+  );
+  _.each(source.defaultOptions, function (defaultOptions, key) {
+    if (_.isObject(defaultOptions)) {
+      sourceOptions.sourceOptions[key] = _.defaults(
+        sourceOptions.sourceOptions[key],
+        defaultOptions
+      );
+    }
+  });
 
-	// Only include the sourceOptions for this source.
-	sourceOptions.sourceOptions = sourceOptions.sourceOptions && sourceOptions.sourceOptions[name] || {};
-	sourceOptions.sourceOptions = _.defaults(sourceOptions.sourceOptions, source.defaultOptions || {});
-	_.each(source.defaultOptions, function(defaultOptions, key) {
-		if (_.isObject(defaultOptions)) {
-			sourceOptions.sourceOptions[key] = _.defaults(sourceOptions.sourceOptions[key], defaultOptions);
-		}
-	});
+  // Prepare request method.
+  sourceOptions.request = this.prepareRequestMethod(options);
 
-	// Prepare request method.
-	sourceOptions.request = this.prepareRequestMethod(options);
+  // Prepare wrapper for getting new puppeteer page instance.
+  sourceOptions.newPage = this.preparePage.bind(this);
 
-	// Prepare wrapper for getting new puppeteer page instance.
-	sourceOptions.newPage = this.preparePage.bind(this);
+  // Prepare wrapper for getting new SafeEventEmitter instance.
+  sourceOptions.newEventEmitter = this.prepareSafeEventEmitter.bind(this);
 
-	// Prepare wrapper for getting new SafeEventEmitter instance.
-	sourceOptions.newEventEmitter = this.prepareSafeEventEmitter.bind(this);
-
-	return sourceOptions;
+  return sourceOptions;
 };
 
-DataSourcer.prototype.prepareRequestMethod = function(options) {
-
-	options = options || {};
-	var defaultRequestOptions = _.defaults(options.defaultRequestOptions || {}, this.defaultOptions.defaultRequestOptions);
-	var fn = request.defaults(defaultRequestOptions);
-	var queue = this.prepareRequestQueue(options.requestQueue);
-	return function() {
-		queue.push({ fn: fn, arguments: arguments });
-	};
+DataSourcer.prototype.prepareRequestMethod = function (options) {
+  options = options || {};
+  var defaultRequestOptions = _.defaults(
+    options.defaultRequestOptions || {},
+    this.defaultOptions.defaultRequestOptions
+  );
+  var fn = request.defaults(defaultRequestOptions);
+  var queue = this.prepareRequestQueue(options.requestQueue);
+  return function () {
+    queue.push({ fn: fn, arguments: arguments });
+  };
 };
 
-DataSourcer.prototype.prepareRequestQueue = function(options) {
-
-	options = _.defaults(options || {}, this.defaultOptions.requestQueue);
-	var queue = async.queue(function(task, next) {
-		var reqId = _.uniqueId('request');
-		var done = _.once(function() {
-			this.activeRequests[reqId] = null;
-			_.delay(next, options.delay);
-		}.bind(this));
-		this.activeRequests[reqId] = task.fn.apply(undefined, task.arguments)
-			.on('error', done)
-			.on('response', done);
-	}.bind(this), options.concurrency);
-	var queueId = _.uniqueId('doRequest');
-	this.queues[queueId] = queue;
-	return queue;
+DataSourcer.prototype.prepareRequestQueue = function (options) {
+  options = _.defaults(options || {}, this.defaultOptions.requestQueue);
+  var queue = async.queue(
+    function (task, next) {
+      var reqId = _.uniqueId("request");
+      var done = _.once(
+        function () {
+          this.activeRequests[reqId] = null;
+          _.delay(next, options.delay);
+        }.bind(this)
+      );
+      this.activeRequests[reqId] = task.fn
+        .apply(undefined, task.arguments)
+        .on("error", done)
+        .on("response", done);
+    }.bind(this),
+    options.concurrency
+  );
+  var queueId = _.uniqueId("doRequest");
+  this.queues[queueId] = queue;
+  return queue;
 };
 
-DataSourcer.prototype.isValidSourceName = function(name) {
-
-	return _.isString(name) && name.length > 0;
+DataSourcer.prototype.isValidSourceName = function (name) {
+  return _.isString(name) && name.length > 0;
 };
 
-DataSourcer.prototype.sourceExists = function(name) {
-
-	return _.has(this.sources, name);
+DataSourcer.prototype.sourceExists = function (name) {
+  return _.has(this.sources, name);
 };
 
-DataSourcer.prototype.preparePage = function(done) {
+DataSourcer.prototype.preparePage = function (done) {
+  if (!_.isFunction(done)) {
+    throw new Error("Missing required callback");
+  }
 
-	if (!_.isFunction(done)) {
-		throw new Error('Missing required callback');
-	}
-
-	this.prepareBrowser(function(error) {
-		if (error) return done(error);
-		this.browser.newPage().then(function(page) {
-			// Assign a random user agent.
-			page.setUserAgent((new UserAgent()).toString()).then(function() {
-				done(null, page);
-			}).catch(done);
-		}).catch(done);
-	}.bind(this));
+  this.prepareBrowser(
+    function (error) {
+      if (error) return done(error);
+      this.browser
+        .newPage()
+        .then(function (page) {
+          // Assign a random user agent.
+          page
+            .setUserAgent(new UserAgent().toString())
+            .then(function () {
+              done(null, page);
+            })
+            .catch(done);
+        })
+        .catch(done);
+    }.bind(this)
+  );
 };
 
-DataSourcer.prototype.prepareBrowser = function(done) {
+DataSourcer.prototype.prepareBrowser = function (done) {
+  if (!_.isFunction(done)) {
+    throw new Error("Missing required callback");
+  }
 
-	if (!_.isFunction(done)) {
-		throw new Error('Missing required callback');
-	}
+  if (this.browser || this.preparingBrowser) {
+    this.onBrowserReady(done);
+    return;
+  }
 
-	if (this.browser || this.preparingBrowser) {
-		this.onBrowserReady(done);
-		return;
-	}
+  this.preparingBrowser = true;
 
-	this.preparingBrowser = true;
+  var options = _.clone(this.options.browser);
 
-	var options = _.clone(this.options.browser);
-
-	/*
+  /*
 		See:
 		https://github.com/GoogleChrome/puppeteer/blob/master/docs/troubleshooting.md#running-puppeteer-on-travis-ci
 	*/
-	if (process.env.TRAVIS_CI) {
-		options.args = [].concat(options.args || [], ['--no-sandbox']);
-	}
+  if (process.env.TRAVIS_CI) {
+    options.args = [].concat(options.args || [], ["--no-sandbox"]);
+  }
+  //             args: chromium.args,
+  // executablePath: await chromium.executablePath
+  options.args = chromium.args;
 
-	puppeteer.launch(options).then(function(browser) {
-		this.browser = DataSourcer.browsers[this.id] = browser;
-		this.queues.onBrowserReady.resume();
-		done();
-	}.bind(this)).catch(done);
+  chromium.executablePath.then(function (path) {
+    options.executablePath = path;
+    puppeteer
+      .launch(options)
+      .then(
+        function (browser) {
+          this.browser = DataSourcer.browsers[this.id] = browser;
+          this.queues.onBrowserReady.resume();
+          done();
+        }.bind(this)
+      )
+      .catch(done);
+  });
 };
 
-DataSourcer.prototype.onBrowserReady = function(fn) {
-
-	if (this.browser) {
-		_.defer(fn);
-	} else {
-		this.queues.onBrowserReady.push({ fn: fn });
-	}
+DataSourcer.prototype.onBrowserReady = function (fn) {
+  if (this.browser) {
+    _.defer(fn);
+  } else {
+    this.queues.onBrowserReady.push({ fn: fn });
+  }
 };
 
-DataSourcer.prototype.prepareInternalQueues = function() {
-
-	this.queues = {
-		onBrowserReady: async.queue(function(task, next) {
-			try {
-				task.fn();
-			} catch (error) {
-				debug.error(error);
-			}
-			next();
-		}, 1),
-		// doRequest1
-		// doRequest2
-		// ...
-	};
+DataSourcer.prototype.prepareInternalQueues = function () {
+  this.queues = {
+    onBrowserReady: async.queue(function (task, next) {
+      try {
+        task.fn();
+      } catch (error) {
+        debug.error(error);
+      }
+      next();
+    }, 1),
+    // doRequest1
+    // doRequest2
+    // ...
+  };
 };
 
-DataSourcer.prototype.pauseAllQueues = function() {
-
-	// Pause all queues.
-	// This prevents execution of queued items until queue.resume() is called.
-	_.invoke(this.queues, 'pause');
+DataSourcer.prototype.pauseAllQueues = function () {
+  // Pause all queues.
+  // This prevents execution of queued items until queue.resume() is called.
+  _.invoke(this.queues, "pause");
 };
 
-DataSourcer.prototype.prepareSafeEventEmitter = function() {
-
-	var safeEventEmitter = new SafeEventEmitter();
-	safeEventEmitter.on('error', function(error) {
-		debug.error(error);
-	});
-	return safeEventEmitter;
+DataSourcer.prototype.prepareSafeEventEmitter = function () {
+  var safeEventEmitter = new SafeEventEmitter();
+  safeEventEmitter.on("error", function (error) {
+    debug.error(error);
+  });
+  return safeEventEmitter;
 };
 
-process.on('SIGINT', function() {
-	// NodeJS process interrupted - kill all browser processes.
-	_.chain(DataSourcer.browsers).compact().each(function(browser) {
-		var child = browser.process();
-		if (child) {
-			child.kill();
-		}
-	});
+process.on("SIGINT", function () {
+  // NodeJS process interrupted - kill all browser processes.
+  _.chain(DataSourcer.browsers)
+    .compact()
+    .each(function (browser) {
+      var child = browser.process();
+      if (child) {
+        child.kill();
+      }
+    });
 });
