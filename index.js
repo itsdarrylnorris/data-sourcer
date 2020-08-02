@@ -727,7 +727,7 @@ DataSourcer.prototype.prepareBrowser = function (done) {
   }
   //             args: chromium.args,
   // executablePath: await chromium.executablePath
-  options.args = chromium.args;
+  //   options.args = chromium.args;
 
   chromium.executablePath.then(function (path) {
     options.executablePath = path;

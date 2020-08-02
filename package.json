@@ -30,8 +30,6 @@
     "async": "3.2.0",
     "chrome-aws-lambda": "^3.1.1",
     "debug": "4.1.1",
-    "puppeteer": "5.2.0",
-    "puppeteer-core": "4.0.1",
     "request": "2.88.2",
     "underscore": "1.10.2",
     "user-agents": "1.0.559",
